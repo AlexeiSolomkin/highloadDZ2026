@@ -246,6 +246,371 @@ flowchart TB
 
 US-East и Франкфурт резервируют друг друга: при отказе одного второй получает `12 530 + 17 040 ≈ 29 600 RPS` ⇒ 3 рабочих сервера, поэтому для сохранения N+1 в аварии добавляем им по одному серверу (+1). Итого: 14 серверов nginx, 10 серверов L4, 10 роутеров.
 
+## 5. Логическая схема БД
+
+ID всех сущностей - 64-битные Snowflake-идентификаторы (время + номер региона + счётчик): они упорядочены по времени создания, а по `user_id` сразу видно домашний регион пользователя. Все данные пользователя хранятся в его домашнем регионе (см. GDPR в части 3). Объёмы считаются на горизонте 1 год, как прирост в части 2.
+
+### 5.1. Основные сущности
+
+```mermaid
+erDiagram
+    PLANS ||--o{ USERS : "тариф"
+    USERS ||--o{ SESSIONS : "входит"
+    USERS ||--o{ CHATS : "владеет"
+    CHATS ||--o{ MESSAGES : "содержит"
+    MODELS ||--o{ CHATS : "текущая модель"
+    MODELS ||--o{ MESSAGES : "сгенерировала"
+    MESSAGES ||--o{ ATTACHMENTS : "прикреплены"
+    MESSAGES ||--o| TOKEN_USAGE : "списание"
+    USERS ||--o{ TOKEN_USAGE : "тратит"
+    USERS ||--o{ QUOTA_COUNTERS : "лимит за период"
+    USERS ||--o{ QUOTA_LEASES : "аренда квоты"
+    USERS {
+        id user_id PK
+        text email UK
+        bytes password_hash
+        text display_name
+        int home_region
+        id plan_id FK
+        id default_model_id FK
+        datetime created_at
+    }
+    SESSIONS {
+        id session_id PK
+        id user_id FK
+        bytes refresh_token_hash UK
+        text device
+        datetime created_at
+        datetime expires_at
+    }
+    PLANS {
+        id plan_id PK
+        text name
+        text period
+        bigint quota_units
+        text allowed_models
+    }
+    MODELS {
+        id model_id PK
+        text name
+        float input_weight
+        float output_weight
+        int context_window
+        bool active
+    }
+    CHATS {
+        id chat_id PK
+        id user_id FK
+        text title
+        id model_id FK
+        int message_count
+        datetime created_at
+        datetime updated_at
+        datetime deleted_at
+    }
+    MESSAGES {
+        id message_id PK
+        id chat_id FK
+        text role
+        id model_id FK
+        text content
+        text status
+        int input_tokens
+        int output_tokens
+        datetime created_at
+    }
+    ATTACHMENTS {
+        id attachment_id PK
+        id message_id FK
+        text object_key
+        text mime_type
+        bigint size_bytes
+        int token_count
+        text text_object_key
+    }
+    TOKEN_USAGE {
+        id message_id PK,FK
+        id user_id FK
+        id model_id FK
+        int input_tokens
+        int output_tokens
+        bigint units
+        datetime created_at
+    }
+    QUOTA_COUNTERS {
+        id user_id PK,FK
+        datetime period_start PK
+        bigint limit_units
+        bigint used_units
+        bigint reserved_units
+        datetime updated_at
+    }
+    QUOTA_LEASES {
+        id user_id PK,FK
+        int dc_id PK
+        bigint leased_units
+        bigint used_units
+        datetime expires_at
+    }
+```
+
+Лимит считается в условных единицах: `units = input_tokens × input_weight + output_tokens × output_weight`. Веса берутся из `MODELS`, поэтому сообщение мощной модели "стоит" больше - так выбор модели напрямую влияет на расход лимита.
+
+| Таблица          | Назначение                                                                                          |
+| ---------------- | --------------------------------------------------------------------------------------------------- |
+| `USERS`          | Аккаунт, тариф, домашний регион, модель по умолчанию                                                |
+| `SESSIONS`       | Refresh-токены устройств; access-токен (JWT) живёт 15 мин и БД не читает                            |
+| `PLANS`          | Тарифы: размер квоты, период (окно 5 ч / неделя), доступные модели. Справочник, ~10 строк          |
+| `MODELS`         | Модели и их веса для пересчёта токенов в единицы лимита. Справочник, ~20 строк                     |
+| `CHATS`          | Чат: заголовок, текущая модель, время последнего сообщения (сортировка в боковой панели)           |
+| `MESSAGES`       | Сообщения пользователя и ответы модели с числом токенов; `status` = streaming / complete / error   |
+| `ATTACHMENTS`    | Метаданные вложения; сам файл и извлечённый из него текст лежат в объектном хранилище              |
+| `TOKEN_USAGE`    | Журнал списаний: одна запись на ответ модели. Источник истины для биллинга и сверки счётчиков      |
+| `QUOTA_COUNTERS` | Текущий расход лимита пользователя за период: использовано + зарезервировано под идущие генерации  |
+| `QUOTA_LEASES`   | "Аренда" части квоты чужим ДЦ (см. часть 3)                                                          |
+
+### 5.2. Файлы, кеши и буферы
+
+```mermaid
+erDiagram
+    ATTACHMENT_OBJECTS {
+        text object_key PK
+        bytes payload
+        bytes sha256
+    }
+    CHAT_LIST_CACHE {
+        id user_id PK
+        bytes top_chats
+        datetime expires_at
+    }
+    CHAT_CONTEXT_CACHE {
+        id chat_id PK
+        bytes last_messages
+        int tokens_total
+        datetime expires_at
+    }
+    STREAM_BUFFER {
+        id message_id PK
+        bytes tokens_so_far
+        int last_event_id
+    }
+    EVENT_LOG {
+        text topic PK
+        int partition PK
+        bigint offset PK
+        id key
+        bytes payload
+    }
+    SEARCH_INDEX {
+        id doc_id PK
+        id user_id
+        id chat_id
+        text text
+        datetime created_at
+    }
+    GPU_KV_CACHE {
+        bytes prefix_hash PK
+        id chat_id
+        bytes kv_blocks
+    }
+```
+
+| Данные               | Назначение                                                                                                         |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `ATTACHMENT_OBJECTS` | Байты вложений и извлечённый из PDF/документов текст (его читает модель); связь по `object_key` из `ATTACHMENTS`   |
+| `CHAT_LIST_CACHE`    | Последние 50 чатов пользователя для боковой панели                                                                 |
+| `CHAT_CONTEXT_CACHE` | Хвост истории активного чата - нужен на каждое новое сообщение, чтобы собрать запрос к модели; TTL 1 ч             |
+| `STREAM_BUFFER`      | Уже сгенерированная часть ответа - чтобы клиент при обрыве переподключился и дочитал (`Last-Event-ID`)              |
+| `EVENT_LOG`          | Очередь событий: сообщения (для поиска и восстановления), списания токенов (для журнала `TOKEN_USAGE`)             |
+| `SEARCH_INDEX`       | Полнотекстовый индекс по названиям чатов и сообщениям пользователя                                                 |
+| `GPU_KV_CACHE`       | Обработанная моделью история чата в памяти GPU; не хранится постоянно, теряется без последствий                    |
+
+Продуктовое решение для поиска: индексируем только названия чатов и сообщения пользователя, без ответов модели. Ответы в ~8 раз длиннее, и индекс по ним стоил бы ~1 ПБ в год, а найти чат почти всегда можно по своему вопросу.
+
+### 5.3. Размеры и нагрузка
+
+Допущения (в дополнение к части 2):
+
+- Аккаунтов ~500 млн (~2×MAU, много неактивных), активных сессий ~370 млн (~1.5 устройства на MAU)
+- Открытия списка чатов и истории чата (8/день на DAU) делятся пополам: пик по 9 080/с
+- Новых чатов `612.5 млн / 4.49 ≈ 136 млн/сутки` → пик ~6 300/с; обновление токена - 2 раза в день на DAU → пик ~4 540/с
+- Списание лимита во время стриминга - каждые ~256 выходных токенов: `1 115 / 256 ≈ 4.4` раза за ответ, плюс резерв до генерации и итоговое списание после
+- Попадание в кеш: список чатов и чат - 80%, история чата - 50%, контекст для генерации - 80% (у первого сообщения чата - 22% всех сообщений - контекста нет)
+
+Нагрузка - глобальный пик (×4 от среднего).
+
+| Таблица          | Строк (1 год) | Байт/строка | Объём      | Чтение, QPS | Запись, QPS |
+| ---------------- | ------------- | ----------- | ---------- | ----------- | ----------- |
+| `USERS`          | 500 млн       | 300         | 0.15 ТБ    | 4 540       | 1 150       |
+| `SESSIONS`       | 370 млн       | 200         | 0.07 ТБ    | 4 540       | 4 540       |
+| `PLANS`, `MODELS`| ~30           | 200         | ~6 КБ      | <10         | ~0          |
+| `CHATS`          | 49.6 млрд     | 500         | 24.8 ТБ    | 3 640       | 42 080      |
+| `MESSAGES`       | 447 млрд      | 2 500       | 1.12 ПБ    | 8 960       | 56 720      |
+| `ATTACHMENTS`    | 14.3 млрд     | 200         | 2.9 ТБ     | (с сообщениями) | 1 800   |
+| `TOKEN_USAGE`    | 224 млрд      | 100         | 22.4 ТБ    | 230         | 28 360      |
+| `QUOTA_COUNTERS` | 245 млн       | 64          | 16 ГБ      | 9 080       | 181 500     |
+| `QUOTA_LEASES`   | ~1 млн        | 64          | 64 МБ      | 600         | 600         |
+
+Откуда цифры:
+
+- `USERS`: чтение при входе и обновлении токена (4 540), запись - смена модели по умолчанию (1 120) и регистрации (~25)
+- `CHATS`: запись = новый чат 6 300 + обновление `updated_at` и счётчика на каждое сообщение 28 360 + автоматический заголовок 6 300 + смена модели 1 120. Чтение = `(9 080 + 9 080) × 20%` промахов кеша
+- `MESSAGES`: две строки на обмен (вопрос и ответ) `2 × 28 360 = 56 720`. Чтение = история `9 080 × 50%` + контекст для генерации `28 360 × 78% × 20%` ≈ 8 960 запросов (каждый - выборка ~10 строк)
+- `TOKEN_USAGE`: одна запись на ответ; чтение - страница расхода у пользователя, плюс фоновая сверка
+- `QUOTA_COUNTERS`: `28 360 × (1 резерв + 4.4 списания + 1 итог) ≈ 181 500` атомарных операций/с. Это самая нагруженная на запись сущность - но строка маленькая и вся таблица помещается в память
+
+| Файлы / кеши / буферы | Количество и размер                         | Объём           | Пиковое чтение / запись                       |
+| --------------------- | ------------------------------------------- | --------------- | --------------------------------------------- |
+| `ATTACHMENT_OBJECTS`  | 14.3 млрд × 0.5 МБ + извлечённый текст ~20 КБ | ~7.4 ПБ/год     | GET с origin ~3 600/с (промахи CDN + чтение текста моделью); PUT ~3 600/с |
+| `CHAT_LIST_CACHE`     | 49 млн DAU × 5 КБ                           | ~245 ГБ         | 9 080 / ~41 000                               |
+| `CHAT_CONTEXT_CACHE`  | ~50 млн чатов, активных за час, × 10 КБ     | ~500 ГБ         | 28 360 / 56 720                               |
+| `STREAM_BUFFER`       | 570 тыс. одновременных ответов × 5 КБ       | ~2.9 ГБ         | дописывается в памяти gateway                 |
+| `EVENT_LOG`           | сообщения - 3 сут, списания - 7 сут         | ~10 ТБ          | 56 720 + 28 360 событий/с                     |
+| `SEARCH_INDEX`        | `(612.5 млн × 0.6 КБ + 136 млн × 0.1 КБ) × 1.5` в сутки | ~210 ТБ/год | 680 / 34 660 документов/с          |
+| `GPU_KV_CACHE`        | в памяти GPU-узлов                          | -               | на каждую генерацию                           |
+
+Все объёмы логические, без реплик и индексов (физические - в части 6).
+
+### 5.4. Консистентность и распределение нагрузки по ключам
+
+| Данные                        | Требование к консистентности                                                                                                     | Распределение нагрузки по ключам                                                                                  |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `USERS`, `SESSIONS`           | Строгая: уникальный email, отзыв сессии действует сразу                                                                          | Равномерно по `user_id`                                                                                           |
+| `QUOTA_COUNTERS`              | Строгая на ключ: резерв и списание атомарны, потерянных обновлений нет. Допустимый перерасход - не больше одного резерва + аренды | По `user_id`. Горячий ключ = активный пользователь, но его нагрузку сверху ограничивает сам лимит                |
+| `TOKEN_USAGE`                 | Итоговая (отставание - секунды), но без потерь и дублей: доставка at-least-once + идемпотентность по `message_id`                 | По `user_id`, только добавление                                                                                    |
+| `MESSAGES`, `CHATS`           | Read-your-writes для автора (своё сообщение видно сразу); на другом устройстве - итоговая, до 1-2 с. Порядок в чате - по `message_id`; в одном чате одновременно идёт одна генерация | По `chat_id` / `user_id`. Размер одного чата ограничен окном контекста модели (~200 тыс. токенов ≈ 1 МБ) - "бесконечно горячих" чатов нет |
+| `ATTACHMENTS` + файлы         | Файл записывается до метаданных; сообщение с вложением появляется только после записи файла. Неотправленные файлы удаляются через 24 ч | Ключ объекта неизменяемый, распределение по хешу                                                                  |
+| Кеши                          | Итоговая: контекст чата обновляется сразу после записи сообщения в БД, список чатов - с TTL                                       | По `user_id` / `chat_id`                                                                                          |
+| `SEARCH_INDEX`                | Итоговая, отставание до ~1 мин                                                                                                   | По `user_id`: поиск всегда внутри своих чатов                                                                      |
+
+Общие особенности распределения:
+
+- Все записи идут "в текущий момент" - поэтому шардировать по времени нельзя (весь поток записи попал бы на один шард). Шардируем по хешу `user_id` / `chat_id`, а время используем только для удаления старых данных
+- Нагрузка по регионам повторяет доли из части 3: Франкфурт хранит и обслуживает ~34% данных
+- Справочники `PLANS` и `MODELS` читаются на каждый запрос, поэтому держатся в памяти сервисов
+
+## 6. Физическая схема БД
+
+### 6.1. Выбор СУБД
+
+| Данные                                    | СУБД                     | Почему                                                                                                                                       |
+| ----------------------------------------- | ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `USERS`, `SESSIONS`, `CHATS`, справочники | PostgreSQL + Citus       | Нужны транзакции, уникальность email и индекс с сортировкой по изменяемому полю (`updated_at` для списка чатов). Citus шардирует таблицы по `user_id` |
+| `MESSAGES` (+ вложения внутри)            | ScyllaDB                 | Самая большая таблица (~1.1 ПБ/год) и ~57 тыс. вставок/с; доступ только по ключу `chat_id` без JOIN. Широкие строки отсортированы по `message_id`. Так же хранит сообщения Discord |
+| `QUOTA_COUNTERS`, `QUOTA_LEASES`          | Redis Cluster (отдельный, с AOF) | ~180 тыс. атомарных операций/с при объёме 16 ГБ: всё в памяти, атомарность через Lua-скрипт на одном шарде                         |
+| Кеши                                      | Redis Cluster (отдельный) | Отдельный кластер, чтобы вытеснение кеша не трогало счётчики лимитов                                                                       |
+| `TOKEN_USAGE`                             | ClickHouse               | Журнал только на добавление, агрегаты по пользователю и периоду, сжатие ×5-10                                                               |
+| `EVENT_LOG`                               | Kafka                    | Надёжная очередь с повторным чтением                                                                                                          |
+| `SEARCH_INDEX`                            | OpenSearch               | Полнотекстовый поиск                                                                                                                          |
+| `ATTACHMENT_OBJECTS`                      | Ceph (S3 API)            | Объектное хранилище на петабайты, erasure coding                                                                                             |
+| `STREAM_BUFFER`                           | Память stream gateway    | Буфер на ~20 с; восстановление при обрыве - через переподключение к тому же gateway (hash по `message_id`)                                   |
+
+### 6.2. Схема
+
+Каждая СУБД развёрнута в каждом регионе отдельно и хранит данные пользователей этого региона. Регион состоит из трёх зон доступности (AZ) - отдельных зданий с независимым питанием. Единственная глобальная таблица - `user_directory` (по ней при входе определяется домашний регион).
+
+```mermaid
+flowchart TD
+    APP["API, stream gateway, workers"] --> PGB["PgBouncer"]
+    PGB --> PG["PostgreSQL + Citus<br/>users, sessions, chats - distributed по user_id, 64 шарда<br/>plans, models - reference tables<br/>IDX chats (user_id, updated_at DESC)"]
+    PG --> PGS["sync standby в другой AZ + async реплика (Patroni)"]
+    APP --> DIR["Global PostgreSQL: user_directory<br/>PK email_hash → user_id, home_region<br/>primary US-East, read-реплики во всех регионах"]
+    APP -->|shard-aware driver| SC["ScyllaDB<br/>messages_by_chat: PK (chat_id), CK message_id DESC<br/>вложения - list внутри сообщения<br/>RF=3 по AZ, LOCAL_QUORUM"]
+    APP --> RQ["Redis Cluster - лимиты<br/>quota:user_id:period HASH, lease:user_id:dc HASH<br/>hash tag user_id, master + replica, AOF everysec"]
+    APP --> RC["Redis Cluster - кеши<br/>chatlist:user_id ZSET, chatctx:chat_id LIST, TTL<br/>master + replica, без персистентности"]
+    APP -->|key = user_id| K["Kafka<br/>chat.messages (3 сут), usage.events (7 сут)<br/>RF=3, acks=all"]
+    K --> CH["ClickHouse<br/>token_usage: ReplacingMergeTree, ORDER BY (user_id, created_at)<br/>MV usage_by_period: SummingMergeTree<br/>шард по user_id, 2 реплики"]
+    K --> OS["OpenSearch<br/>индекс на месяц, routing = user_id, 1 реплика"]
+    APP --> S3["Ceph RGW (S3)<br/>attachments/user_id/attachment_id<br/>EC 6+3 по трём AZ, versioning"]
+    CH -.->|сверка каждые 5 мин| RQ
+```
+
+### 6.3. Таблицы, индексы, шардирование и резервирование
+
+Ключевые определения:
+
+```sql
+-- PostgreSQL + Citus
+CREATE TABLE chats (
+    user_id bigint, chat_id bigint, title text, model_id int,
+    message_count int, created_at timestamptz, updated_at timestamptz, deleted_at timestamptz,
+    PRIMARY KEY (user_id, chat_id)
+);
+SELECT create_distributed_table('chats', 'user_id');
+CREATE INDEX chats_recent ON chats (user_id, updated_at DESC) WHERE deleted_at IS NULL;
+
+-- ScyllaDB
+CREATE TABLE messages_by_chat (
+    chat_id bigint, message_id bigint, user_id bigint, role text, model_id int,
+    content text, status text, input_tokens int, output_tokens int,
+    attachments list<frozen<attachment>>,
+    PRIMARY KEY ((chat_id), message_id)
+) WITH CLUSTERING ORDER BY (message_id DESC);
+
+-- ClickHouse
+CREATE TABLE token_usage (
+    message_id UInt64, user_id UInt64, model_id UInt16,
+    input_tokens UInt32, output_tokens UInt32, units UInt64, created_at DateTime
+) ENGINE = ReplicatedReplacingMergeTree
+PARTITION BY toYYYYMM(created_at) ORDER BY (user_id, created_at, message_id);
+```
+
+| Таблица                   | СУБД, индексы                                                                                           | Шардирование                                     | Резервирование                                            |
+| ------------------------- | ------------------------------------------------------------------------------------------------------- | ------------------------------------------------ | --------------------------------------------------------- |
+| `users`                   | Citus: PK `user_id`; UNIQUE `email`                                                                     | hash `user_id`, 64 шарда на регион               | Primary + sync standby (другая AZ) + async реплика        |
+| `sessions`                | Citus: PK `(user_id, session_id)`; UNIQUE `(user_id, refresh_token_hash)`; IDX `expires_at` для очистки | hash `user_id` (`user_id` зашит в refresh-токен) | То же                                                     |
+| `chats`                   | Citus: PK `(user_id, chat_id)`; IDX `(user_id, updated_at DESC) WHERE deleted_at IS NULL`               | hash `user_id`, колокация с `users`              | То же                                                     |
+| `plans`, `models`         | Citus reference tables                                                                                  | Полная копия на каждом узле                      | Вместе с кластером                                        |
+| `user_directory`          | Глобальный PostgreSQL: PK `email_hash`                                                                  | Без шардирования (~500 млн × 50 Б = 25 ГБ)      | Primary + sync standby в US-East, read-реплики в регионах |
+| `messages_by_chat`        | ScyllaDB: partition `chat_id`, clustering `message_id DESC`                                             | Murmur3-кольцо по `chat_id`                      | RF=3, по реплике в каждой AZ; LOCAL_QUORUM                |
+| `quota`, `lease`          | Redis: HASH, ключи с hash tag `{user_id}`                                                               | 16 384 hash slot                                 | Master + replica в другой AZ (2N), AOF everysec           |
+| `chatlist`, `chatctx`     | Redis: ZSET по `updated_at`, LIST последних сообщений                                                   | hash slot                                        | Master + replica, без персистентности                     |
+| `token_usage`             | ClickHouse: ORDER BY `(user_id, created_at, message_id)`; MV `usage_by_period`                          | `cityHash64(user_id)`                            | ReplicatedMergeTree, 2 реплики в разных AZ                |
+| `chat.messages`, `usage.events` | Kafka, key = `user_id`                                                                            | 128 партиций                                     | RF=3, `min.insync.replicas=2`                             |
+| `search`                  | OpenSearch: индекс на месяц, поля `user_id`, `chat_id`, `text`                                          | routing = `user_id` (поиск бьёт в один шард)     | 1 реплика                                                 |
+| `attachments/*`           | Ceph RGW, ключ `attachments/{user_id}/{attachment_id}`                                                  | CRUSH-хеш по объекту                             | Erasure coding 6+3 по трём AZ (по 3 фрагмента в AZ)       |
+
+Физические объёмы за год (все регионы): ScyllaDB `1.12 ПБ × RF 3 / сжатие ~2 ≈ 1.7 ПБ`; Citus `~28 ТБ × 2 (индексы) × 3 копии ≈ 170 ТБ`; ClickHouse `22.4 ТБ / 5 × 2 ≈ 9 ТБ`; Ceph `7.4 ПБ × 9/6 ≈ 11 ПБ`; OpenSearch `210 ТБ × 2 ≈ 420 ТБ`; Redis ~1.5 ТБ памяти. EC 6+3 при потере целой AZ теряет 3 фрагмента из 9 и всё ещё читает данные.
+
+### 6.4. Денормализация
+
+- `messages_by_chat` хранит `user_id` (проверка доступа без чтения чата), `model_id` и токены (без JOIN с журналом), а вложения - списком прямо в строке сообщения: история чата отдаётся одним запросом к одной партиции. Отдельной таблицы вложений физически нет: скачивание идёт по подписанной ссылке, которой БД не нужна
+- `chats` хранит `updated_at` и `message_count` - чтобы боковая панель строилась по индексу, а не подсчётом сообщений
+- `quota` в Redis - это агрегат `TOKEN_USAGE` за текущий период, а лимит тарифа скопирован в тот же HASH, чтобы проверка шла одной операцией без чтения `plans`
+- `usage_by_period` в ClickHouse - заранее посчитанные суммы для страницы расхода и сверки
+- `user_directory` - глобальная копия связки email → регион, чтобы при входе не опрашивать все регионы
+
+### 6.5. Клиентские библиотеки и балансировка подключений
+
+Бекенд на Go.
+
+| Хранилище       | Библиотека                     | Балансировка / мультиплексирование                                                                                       |
+| --------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| PostgreSQL/Citus| `pgx/v5` + `pgxpool`           | PgBouncer в режиме transaction pooling: тысячи соединений приложений сводятся к сотням соединений с БД. Запись и чтение сразу после записи - в primary, остальное чтение - в реплику |
+| ScyllaDB        | `scylladb/gocql` (shard-aware) | Драйвер сам знает, какой узел и какое ядро владеют ключом, и шлёт запрос прямо туда, без прокси; `LOCAL_QUORUM` на запись и чтение (`R + W > RF` - чтение видит свою запись) |
+| Redis           | `redis/go-redis` (ClusterClient)| Клиент держит карту hash slot → master и ходит напрямую; pipeline для пачек операций; счётчики - только с master        |
+| Kafka           | `twmb/franz-go`                | Идемпотентный producer, батчинг; запись в leader партиции                                                               |
+| ClickHouse      | `clickhouse-go/v2`             | Только пачечная вставка из Kafka (не по строке); чтение через chproxy                                                   |
+| OpenSearch      | `opensearch-go`                | Coordinating-узлы за внутренним балансировщиком; routing по `user_id`                                                   |
+| Ceph RGW        | AWS SDK for Go v2 (S3)         | Несколько RGW за внутренним L4, пул keep-alive соединений                                                                |
+
+Списание лимита - Lua-скрипт в Redis: проверить остаток, зарезервировать, списать - атомарно на одном шарде. Каждая генерация параллельно пишет событие в `usage.events`, и раз в 5 минут счётчики сверяются с ClickHouse. Если Redis при переключении на реплику потерял последнюю секунду списаний, сверка вернёт их.
+
+### 6.6. Резервное копирование
+
+| Компонент        | Как                                                                                                                         | Хранение и восстановление                                                                 |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| PostgreSQL/Citus | pgBackRest: полный бэкап раз в неделю, инкрементальный раз в сутки, непрерывный архив WAL; согласованные точки восстановления Citus | 30 суток; восстановление на любой момент (PITR). Копии лежат в другом регионе той же юрисдикции (данные ЕС - в ЕС) |
+| ScyllaDB         | Scylla Manager: снимок раз в сутки + выгрузка новых SSTable                                                                 | 30 суток; события из `chat.messages` за последние 3 суток досылаются после восстановления |
+| Redis - лимиты   | RDB раз в час + AOF                                                                                                         | При полной потере счётчики пересобираются из ClickHouse `usage_by_period`                 |
+| Redis - кеши     | Не бэкапится                                                                                                                | Прогревается из БД                                                                        |
+| ClickHouse       | `clickhouse-backup` раз в сутки в объектное хранилище                                                                       | 1 год (биллинговые данные)                                                                |
+| Kafka            | Не бэкапится - это буфер (RF=3)                                                                                             | -                                                                                         |
+| OpenSearch       | Снимки раз в сутки                                                                                                          | Можно пересобрать из ScyllaDB                                                             |
+| Ceph             | EC 6+3 по трём AZ + versioning: удалённые файлы хранятся 30 суток                                                           | Отдельной копии в другом регионе нет - сознательно: это +7 ПБ в год, а потеря всех трёх AZ региона маловероятна |
+
+Реплика не заменяет бэкап: ошибочное удаление мгновенно попадает на все реплики, поэтому бэкапы хранятся отдельно, с отдельными правами доступа. Раз в месяц - пробное восстановление.
+
 ## Источники
 
 - [Sensor Tower — State of AI 2026](https://sensortower.com/blog/state-of-ai-2026) - оценка MAU Claude (245 млн web+mobile) и динамика роста
@@ -256,3 +621,11 @@ US-East и Франкфурт резервируют друг друга: при
 - [Anthropic Economic Index — geography](https://www.anthropic.com/research/economic-index-geography) - распределение использования Claude.ai по странам
 - [Testing the Performance of NGINX and NGINX Plus Web Servers (2017)](https://blog.nginx.org/blog/testing-the-performance-of-nginx-and-nginx-plus-web-servers) - CPS для HTTPS
 - [Testing the Performance of NGINX Ingress Controllers in Kubernetes (2019)](https://blog.nginx.org/blog/testing-performance-nginx-ingress-controller-kubernetes) - TLS TPS и HTTPS RPS
+- [Discord — How Discord Stores Trillions of Messages](https://discord.com/blog/how-discord-stores-trillions-of-messages) - хранение сообщений в ScyllaDB с партицией по каналу
+- [ScyllaDB — CQL drivers](https://opensource.docs.scylladb.com/stable/using-scylla/drivers/cql-drivers/index.html) - shard-aware драйверы
+- [Citus — Choosing distribution column](https://docs.citusdata.com/en/stable/sharding/data_modeling.html) - шардирование PostgreSQL по ключу
+- [Redis — Scale with Redis Cluster](https://redis.io/docs/latest/operate/oss_and_stack/management/scaling/) - hash slots и реплики
+- [ClickHouse — MergeTree](https://clickhouse.com/docs/engines/table-engines/mergetree-family/mergetree) - движок журнала токенов
+- [Ceph — Erasure code](https://docs.ceph.com/en/latest/rados/operations/erasure-code/) - EC для вложений
+- [PostgreSQL — Log-Shipping Standby Servers](https://www.postgresql.org/docs/current/warm-standby.html) - репликация
+- [pgBackRest — User Guide](https://pgbackrest.org/user-guide.html) - бэкапы и PITR
